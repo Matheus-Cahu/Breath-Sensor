@@ -1,0 +1,39 @@
+#include <ESP8266WiFi.h>
+#include <WiFiManager.h>
+
+#define RESET_PIN D3  // Pino para reset Wi-Fi (ligue um botão entre D3 e GND)
+
+void setup() {
+  Serial.begin(115200);
+  delay(500);
+
+  pinMode(RESET_PIN, INPUT_PULLUP);
+
+  WiFi.mode(WIFI_STA); // Garante modo estação antes do WiFiManager
+
+  WiFiManager wm;
+  wm.setDebugOutput(true); // Ativa debug opcional
+
+  // autoConnect: tenta conectar, se falhar abre o AP "ConfigESP"
+  if (!wm.autoConnect("ConfigESP")) {
+    Serial.println("Falha ao conectar ou configurar Wi-Fi. Reiniciando...");
+    delay(3000);
+    ESP.restart();
+  }
+
+  Serial.println("Wi-Fi conectado!");
+  Serial.print("IP recebido: ");
+  Serial.println(WiFi.localIP());
+}
+
+void loop() {
+  // Checa se o botão foi pressionado
+  if (digitalRead(RESET_PIN) == LOW) {
+    Serial.println("Botão de reset pressionado: limpando credenciais Wi-Fi e reiniciando...");
+    WiFi.disconnect(true); // Apaga credenciais da flash
+    delay(1200);
+    ESP.restart();         // Reinicia ESP, ao ligar ele entra em modo de configuração
+  }
+
+  // Seu código principal pode ficar aqui
+}

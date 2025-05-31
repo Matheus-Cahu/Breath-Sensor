@@ -8,27 +8,31 @@ extern "C" {
 }
 
 const int ledPin = D1;
-const int botaoPin = D2;
+const int pressureSensorPin = A0;  // Analog pin for pressure sensor
 const int resetWiFiPin = D3;
+
+// Pressure sensor configuration
+const int pressureThreshold = 100;    // Adjust based on your sensor (0-1024 range)
+const int pressureHysteresis = 20;    // Prevents rapid toggling
+const int numReadings = 5;            // Number of readings to average
+int pressureReadings[numReadings];    // Array to store readings
+int readIndex = 0;                    // Current reading index
+int total = 0;                        // Running total
+int averagePressure = 0;              // Average pressure reading
 
 unsigned long tempoUltimoEnvioEstado = 0;
 
-// Variáveis de debounce - LÓGICA CORRIGIDA
-bool botaoAtualmentePressionado = false;  // Estado lógico do botão (true = pressionado)
-bool botaoEstadoAnterior = false;         // Estado anterior para detectar mudanças
-bool leituraAnterior = HIGH;              // Última leitura do pino (HIGH = solto com pull-up)
+// Variáveis de estado do sensor de pressão
+bool pressaoAtiva = false;            // Estado lógico da pressão (true = ativada)
+bool ultimoEstadoEnviado = false;     // Último estado enviado ao servidor
 unsigned long tempoUltimaMudanca = 0;
-unsigned long tempoInicializacao = 0;
-bool sistemaEstabilizado = false;
-const unsigned long tempoDebounce = 50;
-const unsigned long tempoEstabilizacao = 2000; // 2 segundos para estabilizar
+const unsigned long tempoDebounce = 100;  // Increased for pressure sensor stability
 
 String serverEstadoUrl;
-
 IPAddress provisionerIp;
 bool provisionerIpEncontrado = false;
 
-// --- FUNÇÕES DE EEPROM PARA IP DO PROVISIONADOR ---
+// --- FUNÇÕES DE EEPROM ---
 
 #define EEPROM_SIZE 20
 #define EEPROM_ADDR_IP 0
@@ -41,7 +45,7 @@ void salvaProvisionerIp(IPAddress ip) {
     EEPROM.write(EEPROM_ADDR_IP + 1 + i, ipStr[i]);
   }
   EEPROM.commit();
-  Serial.println("IP do provisionador salvo na EEPROM: " + ipStr);
+  Serial.println("IP salvo: " + ipStr);
 }
 
 bool carregaProvisionerIp(IPAddress &ip) {
@@ -53,7 +57,7 @@ bool carregaProvisionerIp(IPAddress &ip) {
   }
   ipBuffer[len] = '\0';
   ip.fromString(String(ipBuffer));
-  Serial.println("IP do provisionador carregado da EEPROM: " + ip.toString());
+  Serial.println("IP carregado: " + ip.toString());
   return true;
 }
 
@@ -70,31 +74,26 @@ bool testarConexaoServidor(IPAddress ip) {
   int httpCode = http.GET();
   http.end();
   
-  Serial.println("Teste " + ip.toString() + ": HTTP " + String(httpCode));
-  
   return (httpCode > 0 && httpCode < 600);
 }
 
-class CustomWiFiManager : public WiFiManager {
-public:
-  IPAddress getProvisionerIP() {
-    return provisionerIP;
+// Initialize pressure sensor readings
+void initializePressureReadings() {
+  // Fill the array with initial readings
+  for (int i = 0; i < numReadings; i++) {
+    pressureReadings[i] = analogRead(pressureSensorPin);
+    total += pressureReadings[i];
+    delay(10);
   }
-  
-  void setProvisionerIP(IPAddress ip) {
-    provisionerIP = ip;
-  }
-
-private:
-  IPAddress provisionerIP;
-};
+  averagePressure = total / numReadings;
+  Serial.println("Pressão inicial (média): " + String(averagePressure));
+}
 
 void setup() {
   Serial.begin(115200);
-  Serial.println("\n=== INICIANDO ESP8266 ===");
+  Serial.println("Iniciando ESP8266 com sensor de pressão...");
   
   pinMode(ledPin, OUTPUT);
-  pinMode(botaoPin, INPUT_PULLUP);
   pinMode(resetWiFiPin, INPUT_PULLUP);
 
   EEPROM.begin(EEPROM_SIZE);
@@ -106,7 +105,7 @@ void setup() {
 
   // Verifica se botão de reset foi pressionado
   if (digitalRead(resetWiFiPin) == LOW) {
-    Serial.println("Resetando Wi-Fi e reiniciando...");
+    Serial.println("Reset WiFi - reiniciando...");
     WiFi.disconnect(true);
     EEPROM.write(EEPROM_ADDR_IP, 0);
     EEPROM.commit();
@@ -114,29 +113,27 @@ void setup() {
     ESP.restart();
   }
 
-  // Primeiro, tenta carregar IP salvo da EEPROM
+  // Carrega IP salvo da EEPROM
   if (carregaProvisionerIp(provisionerIp)) {
     provisionerIpEncontrado = true;
-    Serial.println("Usando IP do provisionador salvo: " + provisionerIp.toString());
   }
 
   // Configuração do WiFiManager
-  CustomWiFiManager wm;
-  WiFiManagerParameter custom_server_ip("server_ip", "IP do Servidor (ex: 192.168.0.80)", "", 15);
+  WiFiManager wm;
+  WiFiManagerParameter custom_server_ip("server_ip", "IP do Servidor", "", 15);
   wm.addParameter(&custom_server_ip);
   wm.setTimeout(180);
   
-  Serial.println("Iniciando processo de conexão Wi-Fi...");
-  Serial.println("Se não conectar automaticamente, o ESP criará um AP chamado 'ProvisionarESP'");
+  Serial.println("Conectando WiFi...");
   
   bool res = wm.autoConnect("ProvisionarESP");
   
   if (!res) {
-    Serial.println("Falha ao conectar ou configurar Wi-Fi.");
+    Serial.println("Falha WiFi - reiniciando");
     ESP.restart();
   }
   
-  // Verifica se foi fornecido um IP customizado
+  // Verifica IP customizado
   String serverIpCustom = custom_server_ip.getValue();
   if (serverIpCustom.length() > 0) {
     IPAddress customIp;
@@ -144,18 +141,14 @@ void setup() {
       provisionerIp = customIp;
       provisionerIpEncontrado = true;
       salvaProvisionerIp(provisionerIp);
-      Serial.println("IP do servidor configurado manualmente: " + provisionerIp.toString());
-    } else {
-      Serial.println("IP customizado inválido: " + serverIpCustom);
     }
   }
 
-  Serial.println("Wi-Fi conectado!");
-  Serial.println("IP do ESP: " + WiFi.localIP().toString());
+  Serial.println("WiFi conectado: " + WiFi.localIP().toString());
 
   // Descoberta automática de IP se necessário
   if (!provisionerIpEncontrado) {
-    Serial.println("IP do servidor não foi configurado. Tentando descoberta automática...");
+    Serial.println("Procurando servidor...");
     
     IPAddress subnet = WiFi.localIP();
     uint32_t subnetInt = (uint32_t)subnet;
@@ -167,56 +160,58 @@ void setup() {
       IPAddress testIp = IPAddress(subnetInt | ipsComuns[i]);
       if (testIp == WiFi.localIP()) continue;
       
-      Serial.println("Testando servidor em: " + testIp.toString());
       if (testarConexaoServidor(testIp)) {
         provisionerIp = testIp;
         provisionerIpEncontrado = true;
         salvaProvisionerIp(provisionerIp);
-        Serial.println("Servidor encontrado automaticamente: " + provisionerIp.toString());
+        Serial.println("Servidor encontrado: " + provisionerIp.toString());
         break;
       }
     }
     
     if (!provisionerIpEncontrado) {
       provisionerIp = WiFi.gatewayIP();
-      Serial.println("Usando gateway como fallback: " + provisionerIp.toString());
+      Serial.println("Usando gateway: " + provisionerIp.toString());
     }
   }
 
   serverEstadoUrl = "http://" + provisionerIp.toString() + ":5000/aviso";
 
-  Serial.println("=== CONFIGURAÇÃO FINAL ===");
-  Serial.println("IP do Provisionador: " + provisionerIp.toString());
-  Serial.println("URL de estado: " + serverEstadoUrl);
-  Serial.println("========================");
-
-  // INICIALIZAÇÃO LIMPA DO BOTÃO
-  Serial.println("\n=== INICIALIZANDO DETECÇÃO DE BOTÃO ===");
+  // Initialize pressure sensor
+  initializePressureReadings();
   
-  // Estado inicial: botão não pressionado
-  botaoAtualmentePressionado = false;
-  botaoEstadoAnterior = false;
-  leituraAnterior = HIGH;  // Pull-up = HIGH quando solto
-  sistemaEstabilizado = false;
-  tempoInicializacao = millis();
+  // DEBUG: Testa o sensor várias vezes para ver o estado real
+  Serial.println("=== TESTE DO SENSOR DE PRESSÃO ===");
+  for (int i = 0; i < 5; i++) {
+    int leitura = analogRead(pressureSensorPin);
+    Serial.println("Leitura " + String(i+1) + ": " + String(leitura) + " (0-1024)");
+    delay(100);
+  }
   
-  // LED apagado inicialmente
-  digitalWrite(ledPin, LOW);
+  // Estado inicial baseado na leitura atual
+  pressaoAtiva = (averagePressure > pressureThreshold);
+  ultimoEstadoEnviado = !pressaoAtiva;     // Força primeiro envio
   
-  Serial.println("Estado inicial: BOTÃO NÃO PRESSIONADO");
-  Serial.println("Iniciando período de estabilização...");
+  digitalWrite(ledPin, pressaoAtiva ? HIGH : LOW);
+  
+  Serial.println("Sistema pronto!");
+  Serial.println("Servidor: " + provisionerIp.toString());
+  Serial.println("Limiar de pressão: " + String(pressureThreshold));
+  Serial.println("Histerese: " + String(pressureHysteresis));
+  Serial.println("Estado inicial da pressão: " + String(pressaoAtiva ? "ATIVA" : "INATIVA"));
+  Serial.println("Leitura inicial do sensor: " + String(averagePressure));
+  Serial.println("=========================");
   
   tempoUltimoEnvioEstado = millis();
 }
 
-void enviarEstadoBotao(bool botaoPressionado) {
+void enviarEstadoPressao(bool pressaoDetectada) {
   if (WiFi.status() == WL_CONNECTED) {
     WiFiClient client;
     HTTPClient http;
 
-    String estadoStr = botaoPressionado ? "true" : "false";
+    String estadoStr = pressaoDetectada ? "true" : "false";
     String url = serverEstadoUrl + "?ativo=" + estadoStr;
-    Serial.println("→ Enviando para servidor: " + String(botaoPressionado ? "PRESSIONADO" : "NÃO PRESSIONADO"));
 
     http.begin(client, url);
     http.addHeader("User-Agent", "ESP8266");
@@ -225,20 +220,62 @@ void enviarEstadoBotao(bool botaoPressionado) {
     int httpCode = http.GET();
 
     if (httpCode > 0) {
-      Serial.printf("✓ Estado enviado com sucesso | HTTP: %d\n", httpCode);
+      Serial.println("Enviado: " + String(pressaoDetectada ? "PRESSÃO ATIVA" : "PRESSÃO INATIVA") + " | HTTP: " + String(httpCode));
     } else {
-      Serial.printf("✗ Falha ao enviar | Erro: %s\n", http.errorToString(httpCode).c_str());
+      Serial.println("Erro no envio: " + http.errorToString(httpCode));
     }
     http.end();
   } else {
-    Serial.println("✗ Wi-Fi desconectado, não foi possível enviar estado.");
+    Serial.println("WiFi desconectado");
   }
 }
 
+// Função para ler a pressão com média móvel e debounce
+bool lerPressaoComDebounce() {
+  static unsigned long tempoMudanca = 0;
+  static bool estadoEstavel = false;
+  static bool estadoAnterior = false;
+  
+  // Atualiza a média móvel
+  total -= pressureReadings[readIndex];
+  pressureReadings[readIndex] = analogRead(pressureSensorPin);
+  total += pressureReadings[readIndex];
+  readIndex = (readIndex + 1) % numReadings;
+  averagePressure = total / numReadings;
+  
+  // Determina o novo estado com histerese
+  bool novoEstado;
+  if (pressaoAtiva) {
+    // Se estava ativo, precisa cair abaixo do limiar - histerese para desativar
+    novoEstado = (averagePressure > (pressureThreshold - pressureHysteresis));
+  } else {
+    // Se estava inativo, precisa subir acima do limiar + histerese para ativar
+    novoEstado = (averagePressure > (pressureThreshold + pressureHysteresis));
+  }
+  
+  // Se o estado mudou, reinicia o timer
+  if (novoEstado != estadoAnterior) {
+    tempoMudanca = millis();
+    estadoEstavel = false;
+  }
+  
+  // Se passou o tempo de debounce e não está estável ainda
+  if (!estadoEstavel && (millis() - tempoMudanca) > tempoDebounce) {
+    estadoEstavel = true;
+    estadoAnterior = novoEstado;
+    return novoEstado;
+  }
+  
+  estadoAnterior = novoEstado;
+  
+  // Se ainda não estabilizou, retorna o estado atual
+  return pressaoAtiva;
+}
+
 void loop() {
-  // Reset WiFi se botão pressionado
+  // Reset WiFi se botão D3 pressionado
   if (digitalRead(resetWiFiPin) == LOW) {
-    Serial.println("Botão D3 pressionado: apagando credenciais e reiniciando...");
+    Serial.println("Reset WiFi...");
     WiFi.disconnect(true);
     EEPROM.write(EEPROM_ADDR_IP, 0);
     EEPROM.commit();
@@ -248,78 +285,41 @@ void loop() {
 
   unsigned long agora = millis();
 
-  // Período de estabilização
-  if (!sistemaEstabilizado) {
-    if ((agora - tempoInicializacao) >= tempoEstabilizacao) {
-      sistemaEstabilizado = true;
-      
-      // Primeira leitura após estabilização
-      delay(100);
-      bool leituraInicial = digitalRead(botaoPin);
-      leituraAnterior = leituraInicial;
-      
-      // Lógica: LOW = pressionado, HIGH = solto (devido ao pull-up)
-      botaoAtualmentePressionado = (leituraInicial == LOW);
-      botaoEstadoAnterior = botaoAtualmentePressionado;
-      
-      Serial.println("✓ Sistema estabilizado!");
-      Serial.println("Estado real detectado: " + String(botaoAtualmentePressionado ? "PRESSIONADO" : "NÃO PRESSIONADO"));
-      Serial.println("Leitura do pino: " + String(leituraInicial == HIGH ? "HIGH (solto)" : "LOW (pressionado)"));
-      Serial.println("Monitoramento ativo.\n");
-    } else {
-      // Durante estabilização, não detecta mudanças
-      digitalWrite(ledPin, LOW);
-      delay(10);
-      return;
-    }
-  }
-
-  // DETECÇÃO DE MUDANÇAS COM DEBOUNCE
-  bool leituraAtual = digitalRead(botaoPin);
+  // Lê a pressão com debounce e média móvel
+  bool novoEstado = lerPressaoComDebounce();
   
-  // Se a leitura mudou, marca o tempo
-  if (leituraAtual != leituraAnterior) {
-    tempoUltimaMudanca = agora;
-    Serial.println("Mudança detectada no pino: " + String(leituraAtual == HIGH ? "HIGH" : "LOW"));
+  // Se o estado mudou, reporta
+  if (novoEstado != pressaoAtiva) {
+    pressaoAtiva = novoEstado;
+    Serial.println("MUDANÇA: Pressão " + String(pressaoAtiva ? "ATIVA" : "INATIVA"));
+    Serial.println("Leitura atual do sensor: " + String(averagePressure));
   }
 
-  // Se passou o tempo de debounce, processa a mudança
-  if ((agora - tempoUltimaMudanca) > tempoDebounce) {
-    // Converte leitura física para estado lógico
-    bool novoEstadoBotao = (leituraAtual == LOW);  // LOW = pressionado
-    
-    // Se o estado lógico mudou
-    if (novoEstadoBotao != botaoAtualmentePressionado) {
-      botaoAtualmentePressionado = novoEstadoBotao;
-      
-      Serial.println("========================");
-      if (botaoAtualmentePressionado) {
-        Serial.println("🔴 BOTÃO PRESSIONADO!");
-      } else {
-        Serial.println("⚪ BOTÃO SOLTO!");
-      }
-      Serial.println("========================");
-    }
+  // Envia estado apenas se mudou OU a cada 10 segundos
+  bool deveEnviar = false;
+  if (pressaoAtiva != ultimoEstadoEnviado) {
+    deveEnviar = true;  // Estado mudou
+  } else if ((agora - tempoUltimoEnvioEstado) >= 1000) {
+    deveEnviar = true;  // Timeout de 10 segundos
   }
-
-  leituraAnterior = leituraAtual;
-
-  // Debug periódico
-  static unsigned long ultimoDebug = 0;
-  if ((agora - ultimoDebug) >= 10000) { // A cada 10 segundos
-    Serial.println("📊 Estado atual: " + String(botaoAtualmentePressionado ? "PRESSIONADO" : "NÃO PRESSIONADO") + 
-                   " | Pino: " + String(leituraAtual == HIGH ? "HIGH" : "LOW"));
-    ultimoDebug = agora;
-  }
-
-  // Envia estado a cada 3 segundos
-  if ((agora - tempoUltimoEnvioEstado) >= 3000) {
-    enviarEstadoBotao(botaoAtualmentePressionado);
+  
+  if (deveEnviar) {
+    enviarEstadoPressao(pressaoAtiva);
+    ultimoEstadoEnviado = pressaoAtiva;
     tempoUltimoEnvioEstado = agora;
   }
 
-  // Controle do LED
-  digitalWrite(ledPin, botaoAtualmentePressionado ? HIGH : LOW);
+  // Controla o LED
+  digitalWrite(ledPin, pressaoAtiva ? HIGH : LOW);
+
+  // Debug a cada 5 segundos
+  static unsigned long ultimoDebug = 0;
+  if ((agora - ultimoDebug) >= 1000) {
+    Serial.println("Status: Pressão=" + String(pressaoAtiva ? "ATIVA" : "INATIVA") + 
+                   " | Sensor=" + String(averagePressure) + 
+                   " | Limiar=" + String(pressureThreshold));
+    ultimoDebug = agora;
+  }
 
   delay(10);
 }

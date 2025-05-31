@@ -1,6 +1,10 @@
 #include <ESP8266WiFi.h>
 #include <ESP8266HTTPClient.h>
-#include <WiFiManager.h>  // Biblioteca de provisionamento
+#include <WiFiManager.h> // Biblioteca WiFiManager
+
+extern "C" {
+  #include "user_interface.h" // Necessário para acessar wifi_softap_get_station_info()
+}
 
 const int ledPin = D1;
 const int botaoPin = D2;
@@ -20,37 +24,54 @@ const unsigned long tempoDebounce = 50;
 String serverUrl;
 String serverEstadoUrl;
 
+IPAddress provisionerIp;
+
 void setup() {
   Serial.begin(115200);
   pinMode(ledPin, OUTPUT);
   pinMode(botaoPin, INPUT_PULLUP);
   pinMode(resetWiFiPin, INPUT_PULLUP);
 
-  // Verifica se botão de reset Wi-Fi foi pressionado
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect();         // Remove conexões salvas
+  WiFi.config(0U, 0U, 0U);   // Libera IP antigo
+  delay(1000);
+
   if (digitalRead(resetWiFiPin) == LOW) {
-    Serial.println("Reset WiFi pressionado, limpando configurações...");
-    WiFiManager wm;
-    wm.resetSettings();         // Remove SSID/senha
-    WiFi.disconnect(true);      // Desconecta e apaga tudo
-    WiFi.config(0U, 0U, 0U);    // Limpa IP estático (usa DHCP)
+    Serial.println("Resetando Wi-Fi e reiniciando...");
+    WiFi.disconnect(true); // Apaga credenciais
     delay(1000);
     ESP.restart();
   }
 
   WiFiManager wm;
-  bool wifiOk = wm.autoConnect("ProvisionarESP");
+  wm.setTimeout(180);
+  bool res = wm.autoConnect("ProvisionarESP");
 
-  if (!wifiOk) {
-    Serial.println("Falha ao conectar, reiniciando...");
-    delay(3000);
+  if (!res) {
+    Serial.println("Falha ao conectar ou configurar Wi-Fi.");
     ESP.restart();
   }
 
-  Serial.println("WiFi conectado! IP: " + WiFi.localIP().toString());
+  delay(500);
 
-  String meuIP = WiFi.localIP().toString();
-  serverUrl = "http://" + meuIP + ":5000/aviso";
-  serverEstadoUrl = "http://" + meuIP + ":5000/estado";
+  // Apenas para DEBUG: lista os IPs conectados ao AP local ANTES do ESP conectar a um roteador.
+  struct station_info *stat_info;
+  stat_info = wifi_softap_get_station_info();
+
+  if (stat_info != NULL) {
+    provisionerIp = IPAddress(stat_info->ip.addr);
+    Serial.print("Dispositivo provisionador provavelmente: ");
+    Serial.println(provisionerIp);
+
+    serverUrl = "http://" + provisionerIp.toString() + ":5000/aviso";
+    serverEstadoUrl = "http://" + provisionerIp.toString() + ":5000/estado";
+  } else {
+    Serial.println("Nenhum dispositivo conectado ao AP. Usando IP do ESP...");
+    IPAddress ip = WiFi.localIP();
+    serverUrl = "http://" + ip.toString() + ":5000/aviso";
+    serverEstadoUrl = "http://" + ip.toString() + ":5000/estado";
+  }
 
   Serial.println("serverUrl: " + serverUrl);
   Serial.println("serverEstadoUrl: " + serverEstadoUrl);
@@ -138,9 +159,8 @@ String urlencode(const char* str) {
 
 void loop() {
   if (digitalRead(resetWiFiPin) == LOW) {
-    Serial.println("Reset WiFi pressionado durante execução. Limpando e reiniciando...");
+    Serial.println("Botão D3 pressionado: apagando credenciais e reiniciando...");
     WiFi.disconnect(true);
-    WiFi.config(0U, 0U, 0U);  // Força uso de DHCP
     delay(1000);
     ESP.restart();
   }
@@ -151,6 +171,7 @@ void loop() {
   if (leituraBotao != estadoAnteriorBotao) {
     tempoUltimaMudanca = agora;
   }
+
   if ((agora - tempoUltimaMudanca) > tempoDebounce) {
     if (leituraBotao != estadoAtualBotao) {
       estadoAtualBotao = leituraBotao;
@@ -165,6 +186,7 @@ void loop() {
       }
     }
   }
+
   estadoAnteriorBotao = leituraBotao;
   bool botaoPressionado = estadoAtualBotao;
 

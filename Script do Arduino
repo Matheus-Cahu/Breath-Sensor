@@ -1,9 +1,10 @@
 #include <ESP8266WiFi.h>
 #include <ESP8266HTTPClient.h>
-#include <WiFiManager.h> // Biblioteca WiFiManager
+#include <WiFiManager.h>
+#include <EEPROM.h>
 
 extern "C" {
-  #include "user_interface.h" // Necessário para acessar wifi_softap_get_station_info()
+  #include "user_interface.h"
 }
 
 const int ledPin = D1;
@@ -25,6 +26,71 @@ String serverUrl;
 String serverEstadoUrl;
 
 IPAddress provisionerIp;
+bool provisionerIpEncontrado = false;
+
+// --- FUNÇÕES DE EEPROM PARA IP DO PROVISIONADOR ---
+
+#define EEPROM_SIZE 20
+#define EEPROM_ADDR_IP 0
+
+void salvaProvisionerIp(IPAddress ip) {
+  String ipStr = ip.toString();
+  int len = ipStr.length();
+  EEPROM.write(EEPROM_ADDR_IP, len);
+  for (int i = 0; i < len; i++) {
+    EEPROM.write(EEPROM_ADDR_IP + 1 + i, ipStr[i]);
+  }
+  EEPROM.commit();
+  Serial.println("IP do provisionador salvo na EEPROM: " + ipStr);
+}
+
+bool carregaProvisionerIp(IPAddress &ip) {
+  int len = EEPROM.read(EEPROM_ADDR_IP);
+  if (len <= 0 || len > 15) return false;
+  char ipBuffer[16];
+  for (int i = 0; i < len; i++) {
+    ipBuffer[i] = EEPROM.read(EEPROM_ADDR_IP + 1 + i);
+  }
+  ipBuffer[len] = '\0';
+  ip.fromString(String(ipBuffer));
+  Serial.println("IP do provisionador carregado da EEPROM: " + ip.toString());
+  return true;
+}
+
+// Testa se um servidor está rodando em um IP específico na porta 5000
+bool testarConexaoServidor(IPAddress ip) {
+  WiFiClient client;
+  HTTPClient http;
+  
+  String testUrl = "http://" + ip.toString() + ":5000/estado?ativo=false";
+  
+  http.begin(client, testUrl);
+  http.addHeader("User-Agent", "ESP8266");
+  http.setTimeout(3000); // 3 segundos de timeout
+  
+  int httpCode = http.GET();
+  http.end();
+  
+  Serial.println("Teste " + ip.toString() + ": HTTP " + String(httpCode));
+  
+  // Se recebeu resposta HTTP válida (mesmo que seja erro 404), o servidor existe
+  return (httpCode > 0 && httpCode < 600);
+}
+
+// Classe customizada do WiFiManager para capturar o IP do provisionador
+class CustomWiFiManager : public WiFiManager {
+public:
+  IPAddress getProvisionerIP() {
+    return provisionerIP;
+  }
+  
+  void setProvisionerIP(IPAddress ip) {
+    provisionerIP = ip;
+  }
+
+private:
+  IPAddress provisionerIP;
+};
 
 void setup() {
   Serial.begin(115200);
@@ -32,54 +98,120 @@ void setup() {
   pinMode(botaoPin, INPUT_PULLUP);
   pinMode(resetWiFiPin, INPUT_PULLUP);
 
+  EEPROM.begin(EEPROM_SIZE);
+
   WiFi.mode(WIFI_STA);
-  WiFi.disconnect();         // Remove conexões salvas
-  WiFi.config(0U, 0U, 0U);   // Libera IP antigo
+  WiFi.disconnect();
+  WiFi.config(0U, 0U, 0U);
   delay(1000);
 
+  // Verifica se botão de reset foi pressionado
   if (digitalRead(resetWiFiPin) == LOW) {
     Serial.println("Resetando Wi-Fi e reiniciando...");
-    WiFi.disconnect(true); // Apaga credenciais
+    WiFi.disconnect(true);
+    EEPROM.write(EEPROM_ADDR_IP, 0);
+    EEPROM.commit();
     delay(1000);
     ESP.restart();
   }
 
-  WiFiManager wm;
+  // Primeiro, tenta carregar IP salvo da EEPROM
+  if (carregaProvisionerIp(provisionerIp)) {
+    provisionerIpEncontrado = true;
+    Serial.println("Usando IP do provisionador salvo: " + provisionerIp.toString());
+  }
+
+  // Configuração do WiFiManager com campo customizado para IP do servidor
+  CustomWiFiManager wm;
+  
+  // Campo customizado para o IP do servidor
+  WiFiManagerParameter custom_server_ip("server_ip", "IP do Servidor (ex: 192.168.0.80)", "", 15);
+  wm.addParameter(&custom_server_ip);
+  
   wm.setTimeout(180);
+  
+  Serial.println("Iniciando processo de conexão Wi-Fi...");
+  Serial.println("Se não conectar automaticamente, o ESP criará um AP chamado 'ProvisionarESP'");
+  
+  // Executa o WiFiManager
   bool res = wm.autoConnect("ProvisionarESP");
+  
+  if (!res) {
+    Serial.println("Falha ao conectar ou configurar Wi-Fi.");
+    ESP.restart();
+  }
+  
+  // Verifica se foi fornecido um IP customizado
+  String serverIpCustom = custom_server_ip.getValue();
+  if (serverIpCustom.length() > 0) {
+    IPAddress customIp;
+    if (customIp.fromString(serverIpCustom)) {
+      provisionerIp = customIp;
+      provisionerIpEncontrado = true;
+      salvaProvisionerIp(provisionerIp);
+      Serial.println("IP do servidor configurado manualmente: " + provisionerIp.toString());
+    } else {
+      Serial.println("IP customizado inválido: " + serverIpCustom);
+    }
+  }
 
   if (!res) {
     Serial.println("Falha ao conectar ou configurar Wi-Fi.");
     ESP.restart();
   }
 
-  delay(500);
+  Serial.println("Wi-Fi conectado!");
+  Serial.println("IP do ESP: " + WiFi.localIP().toString());
 
-  // Apenas para DEBUG: lista os IPs conectados ao AP local ANTES do ESP conectar a um roteador.
-  struct station_info *stat_info;
-  stat_info = wifi_softap_get_station_info();
-
-  if (stat_info != NULL) {
-    provisionerIp = IPAddress(stat_info->ip.addr);
-    Serial.print("Dispositivo provisionador provavelmente: ");
-    Serial.println(provisionerIp);
-
-    serverUrl = "http://" + provisionerIp.toString() + ":5000/aviso";
-    serverEstadoUrl = "http://" + provisionerIp.toString() + ":5000/estado";
-  } else {
-    Serial.println("Nenhum dispositivo conectado ao AP. Usando IP do ESP...");
-    IPAddress ip = WiFi.localIP();
-    serverUrl = "http://" + ip.toString() + ":5000/aviso";
-    serverEstadoUrl = "http://" + ip.toString() + ":5000/estado";
+  // Se ainda não temos o IP do provisionador, tenta descobrir automaticamente
+  if (!provisionerIpEncontrado) {
+    Serial.println("IP do servidor não foi configurado. Tentando descoberta automática...");
+    
+    // Tenta alguns IPs comuns na rede
+    IPAddress subnet = WiFi.localIP();
+    uint32_t subnetInt = (uint32_t)subnet;
+    subnetInt = subnetInt & 0xFFFFFF00; // Máscara 255.255.255.0
+    
+    // Testa alguns IPs comuns primeiro (gateway, .1, .100, .101, etc.)
+    int ipsComuns[] = {1, 100, 101, 102, 50, 80, 200, 254};
+    
+    for (int i = 0; i < 8; i++) {
+      IPAddress testIp = IPAddress(subnetInt | ipsComuns[i]);
+      if (testIp == WiFi.localIP()) continue; // Pula o próprio IP
+      
+      Serial.println("Testando servidor em: " + testIp.toString());
+      if (testarConexaoServidor(testIp)) {
+        provisionerIp = testIp;
+        provisionerIpEncontrado = true;
+        salvaProvisionerIp(provisionerIp);
+        Serial.println("Servidor encontrado automaticamente: " + provisionerIp.toString());
+        break;
+      }
+    }
+    
+    // Se ainda não encontrou, usa o gateway
+    if (!provisionerIpEncontrado) {
+      provisionerIp = WiFi.gatewayIP();
+      Serial.println("Usando gateway como fallback: " + provisionerIp.toString());
+    }
   }
 
-  Serial.println("serverUrl: " + serverUrl);
-  Serial.println("serverEstadoUrl: " + serverEstadoUrl);
+  // Configura as URLs dos serviços
+  serverUrl = "http://" + provisionerIp.toString() + ":5000/aviso";
+  serverEstadoUrl = "http://" + provisionerIp.toString() + ":5000/estado";
+
+  Serial.println("=== CONFIGURAÇÃO FINAL ===");
+  Serial.println("IP do Provisionador: " + provisionerIp.toString());
+  Serial.println("URL de aviso: " + serverUrl);
+  Serial.println("URL de estado: " + serverEstadoUrl);
+  Serial.println("========================");
 
   digitalWrite(ledPin, LOW);
   tempoUltimoAperto = millis();
   tempoUltimaMensagem = millis();
   tempoUltimoEnvioEstado = millis();
+  
+  Serial.println("Sistema inicializado!");
 }
 
 void enviarAviso(const char* mensagem) {
@@ -88,7 +220,7 @@ void enviarAviso(const char* mensagem) {
     HTTPClient http;
 
     String url = serverUrl + "?mensagem=" + urlencode(mensagem);
-    Serial.println("Enviando para URL: " + url);
+    Serial.println("Enviando aviso para: " + url);
 
     http.begin(client, url);
     http.addHeader("User-Agent", "ESP8266");
@@ -116,7 +248,7 @@ void enviarEstadoBotao(bool estado) {
 
     String estadoStr = estado ? "true" : "false";
     String url = serverEstadoUrl + "?ativo=" + estadoStr;
-    Serial.println("Enviando estado do botão para URL: " + url);
+    Serial.println("Enviando estado do botão para: " + url);
 
     http.begin(client, url);
     http.addHeader("User-Agent", "ESP8266");
@@ -158,15 +290,19 @@ String urlencode(const char* str) {
 }
 
 void loop() {
+  // Verifica se botão de reset foi pressionado
   if (digitalRead(resetWiFiPin) == LOW) {
     Serial.println("Botão D3 pressionado: apagando credenciais e reiniciando...");
     WiFi.disconnect(true);
+    EEPROM.write(EEPROM_ADDR_IP, 0);
+    EEPROM.commit();
     delay(1000);
     ESP.restart();
   }
 
   unsigned long agora = millis();
 
+  // Debounce do botão
   bool leituraBotao = (digitalRead(botaoPin) == HIGH);
   if (leituraBotao != estadoAnteriorBotao) {
     tempoUltimaMudanca = agora;
@@ -190,20 +326,22 @@ void loop() {
   estadoAnteriorBotao = leituraBotao;
   bool botaoPressionado = estadoAtualBotao;
 
+  // Envia estado do botão a cada 3 segundos
   if ((agora - tempoUltimoEnvioEstado) >= 3000) {
     enviarEstadoBotao(botaoPressionado);
     tempoUltimoEnvioEstado = agora;
   }
 
+  // Lógica do LED e alertas
   if (botaoPressionado) {
     digitalWrite(ledPin, HIGH);
-  } else if (agora - tempoUltimoAperto > 10000) {
+  } else if (agora - tempoUltimoAperto > 10000) { // 10 segundos sem detecção
     digitalWrite(ledPin, HIGH);
     if (!alertaAtivo) {
       enviarAviso("Sem fluxo respiratorio - ALERTA INICIADO");
       alertaAtivo = true;
       tempoUltimaMensagem = agora;
-    } else if (agora - tempoUltimaMensagem >= 1000) {
+    } else if (agora - tempoUltimaMensagem >= 1000) { // Alerta contínuo a cada 1 segundo
       enviarAviso("Sem fluxo respiratorio - ALERTA CONTINUO");
       tempoUltimaMensagem = agora;
     }

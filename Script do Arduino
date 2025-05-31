@@ -1,56 +1,80 @@
 #include <ESP8266WiFi.h>
 #include <ESP8266HTTPClient.h>
-
-const char* ssid = "AnaMalta";
-const char* password = "Alm213164";
-const char* serverUrl = "http://SEU IP PÚBLICO:5000/aviso";
+#include <WiFiManager.h>  // Biblioteca de provisionamento
 
 const int ledPin = D1;
 const int botaoPin = D2;
+const int resetWiFiPin = D3;
 
 unsigned long tempoUltimoAperto = 0;
 unsigned long tempoUltimaMensagem = 0;
+unsigned long tempoUltimoEnvioEstado = 0;
 bool fluxoDetectado = false;
-bool alertaAtivo = false;  // Nova variável para controlar o estado de alerta
+bool alertaAtivo = false;
 
-// Variáveis para debounce do botão
 bool estadoAnteriorBotao = false;
 bool estadoAtualBotao = false;
 unsigned long tempoUltimaMudanca = 0;
-const unsigned long tempoDebounce = 50;  // 50ms de debounce
+const unsigned long tempoDebounce = 50;
+
+String serverUrl;
+String serverEstadoUrl;
 
 void setup() {
   Serial.begin(115200);
   pinMode(ledPin, OUTPUT);
   pinMode(botaoPin, INPUT_PULLUP);
-  
-  WiFi.begin(ssid, password);
-  Serial.print("Conectando ao Wi-Fi");
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
-    Serial.print(".");
+  pinMode(resetWiFiPin, INPUT_PULLUP);
+
+  // Verifica se botão de reset Wi-Fi foi pressionado
+  if (digitalRead(resetWiFiPin) == LOW) {
+    Serial.println("Reset WiFi pressionado, limpando configurações...");
+    WiFiManager wm;
+    wm.resetSettings();         // Remove SSID/senha
+    WiFi.disconnect(true);      // Desconecta e apaga tudo
+    WiFi.config(0U, 0U, 0U);    // Limpa IP estático (usa DHCP)
+    delay(1000);
+    ESP.restart();
   }
-  Serial.println("\nWiFi conectado. IP: " + WiFi.localIP().toString());
-  
+
+  WiFiManager wm;
+  bool wifiOk = wm.autoConnect("ProvisionarESP");
+
+  if (!wifiOk) {
+    Serial.println("Falha ao conectar, reiniciando...");
+    delay(3000);
+    ESP.restart();
+  }
+
+  Serial.println("WiFi conectado! IP: " + WiFi.localIP().toString());
+
+  String meuIP = WiFi.localIP().toString();
+  serverUrl = "http://" + meuIP + ":5000/aviso";
+  serverEstadoUrl = "http://" + meuIP + ":5000/estado";
+
+  Serial.println("serverUrl: " + serverUrl);
+  Serial.println("serverEstadoUrl: " + serverEstadoUrl);
+
   digitalWrite(ledPin, LOW);
   tempoUltimoAperto = millis();
   tempoUltimaMensagem = millis();
+  tempoUltimoEnvioEstado = millis();
 }
 
 void enviarAviso(const char* mensagem) {
   if (WiFi.status() == WL_CONNECTED) {
     WiFiClient client;
     HTTPClient http;
-    
-    String url = String(serverUrl) + "?mensagem=" + urlencode(mensagem);
+
+    String url = serverUrl + "?mensagem=" + urlencode(mensagem);
     Serial.println("Enviando para URL: " + url);
-    
+
     http.begin(client, url);
     http.addHeader("User-Agent", "ESP8266");
-    http.setTimeout(5000);  // Timeout de 5 segundos
-    
+    http.setTimeout(5000);
+
     int httpCode = http.GET();
-    
+
     if (httpCode > 0) {
       String payload = http.getString();
       Serial.printf("Aviso enviado: %s | Código HTTP: %d\n", mensagem, httpCode);
@@ -61,8 +85,33 @@ void enviarAviso(const char* mensagem) {
     http.end();
   } else {
     Serial.println("Wi-Fi desconectado, não foi possível enviar aviso.");
-    // Tentar reconectar
-    WiFi.begin(ssid, password);
+  }
+}
+
+void enviarEstadoBotao(bool estado) {
+  if (WiFi.status() == WL_CONNECTED) {
+    WiFiClient client;
+    HTTPClient http;
+
+    String estadoStr = estado ? "true" : "false";
+    String url = serverEstadoUrl + "?ativo=" + estadoStr;
+    Serial.println("Enviando estado do botão para URL: " + url);
+
+    http.begin(client, url);
+    http.addHeader("User-Agent", "ESP8266");
+    http.setTimeout(5000);
+
+    int httpCode = http.GET();
+
+    if (httpCode > 0) {
+      String payload = http.getString();
+      Serial.printf("Estado enviado: %s | Código HTTP: %d\n", estadoStr.c_str(), httpCode);
+    } else {
+      Serial.printf("Falha ao enviar estado: %s | Erro: %s\n", estadoStr.c_str(), http.errorToString(httpCode).c_str());
+    }
+    http.end();
+  } else {
+    Serial.println("Wi-Fi desconectado, não foi possível enviar estado.");
   }
 }
 
@@ -71,7 +120,7 @@ String urlencode(const char* str) {
   char c;
   char code0;
   char code1;
-  
+
   for (int i = 0; str[i] != 0; i++) {
     c = str[i];
     if (isalnum(c)) {
@@ -88,28 +137,27 @@ String urlencode(const char* str) {
 }
 
 void loop() {
-  unsigned long agora = millis();
-  
-  // Leitura do botão com debounce
-  bool leituraBotao = (digitalRead(botaoPin) == HIGH);
-  
-  // Se a leitura mudou desde a última vez
-  if (leituraBotao != estadoAnteriorBotao) {
-    tempoUltimaMudanca = agora;  // Marca o tempo da mudança
+  if (digitalRead(resetWiFiPin) == LOW) {
+    Serial.println("Reset WiFi pressionado durante execução. Limpando e reiniciando...");
+    WiFi.disconnect(true);
+    WiFi.config(0U, 0U, 0U);  // Força uso de DHCP
+    delay(1000);
+    ESP.restart();
   }
-  
-  // Se passou o tempo de debounce desde a última mudança
+
+  unsigned long agora = millis();
+
+  bool leituraBotao = (digitalRead(botaoPin) == HIGH);
+  if (leituraBotao != estadoAnteriorBotao) {
+    tempoUltimaMudanca = agora;
+  }
   if ((agora - tempoUltimaMudanca) > tempoDebounce) {
-    // Se o estado atual é diferente do que tínhamos
     if (leituraBotao != estadoAtualBotao) {
       estadoAtualBotao = leituraBotao;
-      
-      // Se o botão foi pressionado (mudou de false para true)
       if (estadoAtualBotao) {
         Serial.println("*** BOTÃO PRESSIONADO DETECTADO ***");
-        tempoUltimoAperto = agora;  // SEMPRE reseta o timer quando pressionado
-        alertaAtivo = false;  // Desativa qualquer alerta ativo
-        
+        tempoUltimoAperto = agora;
+        alertaAtivo = false;
         if (!fluxoDetectado) {
           enviarAviso("Fluxo respiratorio detectado");
           fluxoDetectado = true;
@@ -117,48 +165,32 @@ void loop() {
       }
     }
   }
-  
-  // Salva o estado para a próxima iteração
   estadoAnteriorBotao = leituraBotao;
-  
   bool botaoPressionado = estadoAtualBotao;
-  
-  Serial.print("Leitura bruta: ");
-  Serial.print(digitalRead(botaoPin));
-  Serial.print(" | Botão: ");
-  Serial.print(botaoPressionado ? "PRESSIONADO" : "SOLTO");
-  Serial.print(" | Tempo desde último aperto: ");
-  Serial.print((agora - tempoUltimoAperto) / 1000);
-  Serial.println("s");
-  
-  // Controle do LED e estados baseado no botão processado
+
+  if ((agora - tempoUltimoEnvioEstado) >= 3000) {
+    enviarEstadoBotao(botaoPressionado);
+    tempoUltimoEnvioEstado = agora;
+  }
+
   if (botaoPressionado) {
     digitalWrite(ledPin, HIGH);
-    // Não precisa atualizar tempoUltimoAperto aqui pois já foi feito na detecção de borda
-  }
-  // Trata a ausência de fluxo
-  else if (agora - tempoUltimoAperto > 10000) {
-    digitalWrite(ledPin, HIGH); // LED acende como alerta
-    
-    // Primeira vez que entra no estado de alerta
+  } else if (agora - tempoUltimoAperto > 10000) {
+    digitalWrite(ledPin, HIGH);
     if (!alertaAtivo) {
       enviarAviso("Sem fluxo respiratorio - ALERTA INICIADO");
       alertaAtivo = true;
       tempoUltimaMensagem = agora;
-    }
-    // Continua enviando alertas a cada segundo
-    else if (agora - tempoUltimaMensagem >= 1000) {
+    } else if (agora - tempoUltimaMensagem >= 1000) {
       enviarAviso("Sem fluxo respiratorio - ALERTA CONTINUO");
       tempoUltimaMensagem = agora;
     }
-    
     fluxoDetectado = false;
-  }
-  // Caso normal: botão solto e ainda não passaram 10s
-  else {
-    digitalWrite(ledPin, LOW); // LED apagado
+  } else {
+    digitalWrite(ledPin, LOW);
     fluxoDetectado = false;
     alertaAtivo = false;
   }
-  
-  delay(10);  // Delay menor para melhor responsividade do botão
+
+  delay(10);
+}

@@ -11,18 +11,18 @@ const int ledPin = D1;
 const int botaoPin = D2;
 const int resetWiFiPin = D3;
 
-unsigned long tempoUltimoAperto = 0;
-unsigned long tempoUltimaMensagem = 0;
 unsigned long tempoUltimoEnvioEstado = 0;
-bool fluxoDetectado = false;
-bool alertaAtivo = false;
 
-bool estadoAnteriorBotao = false;
-bool estadoAtualBotao = false;
+// Variáveis de debounce - LÓGICA CORRIGIDA
+bool botaoAtualmentePressionado = false;  // Estado lógico do botão (true = pressionado)
+bool botaoEstadoAnterior = false;         // Estado anterior para detectar mudanças
+bool leituraAnterior = HIGH;              // Última leitura do pino (HIGH = solto com pull-up)
 unsigned long tempoUltimaMudanca = 0;
+unsigned long tempoInicializacao = 0;
+bool sistemaEstabilizado = false;
 const unsigned long tempoDebounce = 50;
+const unsigned long tempoEstabilizacao = 2000; // 2 segundos para estabilizar
 
-String serverUrl;
 String serverEstadoUrl;
 
 IPAddress provisionerIp;
@@ -57,27 +57,24 @@ bool carregaProvisionerIp(IPAddress &ip) {
   return true;
 }
 
-// Testa se um servidor está rodando em um IP específico na porta 5000
 bool testarConexaoServidor(IPAddress ip) {
   WiFiClient client;
   HTTPClient http;
   
-  String testUrl = "http://" + ip.toString() + ":5000/estado?ativo=false";
+  String testUrl = "http://" + ip.toString() + ":5000/aviso?ativo=false";
   
   http.begin(client, testUrl);
   http.addHeader("User-Agent", "ESP8266");
-  http.setTimeout(3000); // 3 segundos de timeout
+  http.setTimeout(3000);
   
   int httpCode = http.GET();
   http.end();
   
   Serial.println("Teste " + ip.toString() + ": HTTP " + String(httpCode));
   
-  // Se recebeu resposta HTTP válida (mesmo que seja erro 404), o servidor existe
   return (httpCode > 0 && httpCode < 600);
 }
 
-// Classe customizada do WiFiManager para capturar o IP do provisionador
 class CustomWiFiManager : public WiFiManager {
 public:
   IPAddress getProvisionerIP() {
@@ -94,6 +91,8 @@ private:
 
 void setup() {
   Serial.begin(115200);
+  Serial.println("\n=== INICIANDO ESP8266 ===");
+  
   pinMode(ledPin, OUTPUT);
   pinMode(botaoPin, INPUT_PULLUP);
   pinMode(resetWiFiPin, INPUT_PULLUP);
@@ -121,19 +120,15 @@ void setup() {
     Serial.println("Usando IP do provisionador salvo: " + provisionerIp.toString());
   }
 
-  // Configuração do WiFiManager com campo customizado para IP do servidor
+  // Configuração do WiFiManager
   CustomWiFiManager wm;
-  
-  // Campo customizado para o IP do servidor
   WiFiManagerParameter custom_server_ip("server_ip", "IP do Servidor (ex: 192.168.0.80)", "", 15);
   wm.addParameter(&custom_server_ip);
-  
   wm.setTimeout(180);
   
   Serial.println("Iniciando processo de conexão Wi-Fi...");
   Serial.println("Se não conectar automaticamente, o ESP criará um AP chamado 'ProvisionarESP'");
   
-  // Executa o WiFiManager
   bool res = wm.autoConnect("ProvisionarESP");
   
   if (!res) {
@@ -155,29 +150,22 @@ void setup() {
     }
   }
 
-  if (!res) {
-    Serial.println("Falha ao conectar ou configurar Wi-Fi.");
-    ESP.restart();
-  }
-
   Serial.println("Wi-Fi conectado!");
   Serial.println("IP do ESP: " + WiFi.localIP().toString());
 
-  // Se ainda não temos o IP do provisionador, tenta descobrir automaticamente
+  // Descoberta automática de IP se necessário
   if (!provisionerIpEncontrado) {
     Serial.println("IP do servidor não foi configurado. Tentando descoberta automática...");
     
-    // Tenta alguns IPs comuns na rede
     IPAddress subnet = WiFi.localIP();
     uint32_t subnetInt = (uint32_t)subnet;
-    subnetInt = subnetInt & 0xFFFFFF00; // Máscara 255.255.255.0
+    subnetInt = subnetInt & 0xFFFFFF00;
     
-    // Testa alguns IPs comuns primeiro (gateway, .1, .100, .101, etc.)
     int ipsComuns[] = {1, 100, 101, 102, 50, 80, 200, 254};
     
     for (int i = 0; i < 8; i++) {
       IPAddress testIp = IPAddress(subnetInt | ipsComuns[i]);
-      if (testIp == WiFi.localIP()) continue; // Pula o próprio IP
+      if (testIp == WiFi.localIP()) continue;
       
       Serial.println("Testando servidor em: " + testIp.toString());
       if (testarConexaoServidor(testIp)) {
@@ -189,66 +177,46 @@ void setup() {
       }
     }
     
-    // Se ainda não encontrou, usa o gateway
     if (!provisionerIpEncontrado) {
       provisionerIp = WiFi.gatewayIP();
       Serial.println("Usando gateway como fallback: " + provisionerIp.toString());
     }
   }
 
-  // Configura as URLs dos serviços
-  serverUrl = "http://" + provisionerIp.toString() + ":5000/aviso";
-  serverEstadoUrl = "http://" + provisionerIp.toString() + ":5000/estado";
+  serverEstadoUrl = "http://" + provisionerIp.toString() + ":5000/aviso";
 
   Serial.println("=== CONFIGURAÇÃO FINAL ===");
   Serial.println("IP do Provisionador: " + provisionerIp.toString());
-  Serial.println("URL de aviso: " + serverUrl);
   Serial.println("URL de estado: " + serverEstadoUrl);
   Serial.println("========================");
 
-  digitalWrite(ledPin, LOW);
-  tempoUltimoAperto = millis();
-  tempoUltimaMensagem = millis();
-  tempoUltimoEnvioEstado = millis();
+  // INICIALIZAÇÃO LIMPA DO BOTÃO
+  Serial.println("\n=== INICIALIZANDO DETECÇÃO DE BOTÃO ===");
   
-  Serial.println("Sistema inicializado!");
+  // Estado inicial: botão não pressionado
+  botaoAtualmentePressionado = false;
+  botaoEstadoAnterior = false;
+  leituraAnterior = HIGH;  // Pull-up = HIGH quando solto
+  sistemaEstabilizado = false;
+  tempoInicializacao = millis();
+  
+  // LED apagado inicialmente
+  digitalWrite(ledPin, LOW);
+  
+  Serial.println("Estado inicial: BOTÃO NÃO PRESSIONADO");
+  Serial.println("Iniciando período de estabilização...");
+  
+  tempoUltimoEnvioEstado = millis();
 }
 
-void enviarAviso(const char* mensagem) {
+void enviarEstadoBotao(bool botaoPressionado) {
   if (WiFi.status() == WL_CONNECTED) {
     WiFiClient client;
     HTTPClient http;
 
-    String url = serverUrl + "?mensagem=" + urlencode(mensagem);
-    Serial.println("Enviando aviso para: " + url);
-
-    http.begin(client, url);
-    http.addHeader("User-Agent", "ESP8266");
-    http.setTimeout(5000);
-
-    int httpCode = http.GET();
-
-    if (httpCode > 0) {
-      String payload = http.getString();
-      Serial.printf("Aviso enviado: %s | Código HTTP: %d\n", mensagem, httpCode);
-      Serial.println("Resposta: " + payload);
-    } else {
-      Serial.printf("Falha ao enviar aviso: %s | Erro: %s\n", mensagem, http.errorToString(httpCode).c_str());
-    }
-    http.end();
-  } else {
-    Serial.println("Wi-Fi desconectado, não foi possível enviar aviso.");
-  }
-}
-
-void enviarEstadoBotao(bool estado) {
-  if (WiFi.status() == WL_CONNECTED) {
-    WiFiClient client;
-    HTTPClient http;
-
-    String estadoStr = estado ? "true" : "false";
+    String estadoStr = botaoPressionado ? "true" : "false";
     String url = serverEstadoUrl + "?ativo=" + estadoStr;
-    Serial.println("Enviando estado do botão para: " + url);
+    Serial.println("→ Enviando para servidor: " + String(botaoPressionado ? "PRESSIONADO" : "NÃO PRESSIONADO"));
 
     http.begin(client, url);
     http.addHeader("User-Agent", "ESP8266");
@@ -257,40 +225,18 @@ void enviarEstadoBotao(bool estado) {
     int httpCode = http.GET();
 
     if (httpCode > 0) {
-      String payload = http.getString();
-      Serial.printf("Estado enviado: %s | Código HTTP: %d\n", estadoStr.c_str(), httpCode);
+      Serial.printf("✓ Estado enviado com sucesso | HTTP: %d\n", httpCode);
     } else {
-      Serial.printf("Falha ao enviar estado: %s | Erro: %s\n", estadoStr.c_str(), http.errorToString(httpCode).c_str());
+      Serial.printf("✗ Falha ao enviar | Erro: %s\n", http.errorToString(httpCode).c_str());
     }
     http.end();
   } else {
-    Serial.println("Wi-Fi desconectado, não foi possível enviar estado.");
+    Serial.println("✗ Wi-Fi desconectado, não foi possível enviar estado.");
   }
-}
-
-String urlencode(const char* str) {
-  String encodedString = "";
-  char c;
-  char code0;
-  char code1;
-
-  for (int i = 0; str[i] != 0; i++) {
-    c = str[i];
-    if (isalnum(c)) {
-      encodedString += c;
-    } else {
-      encodedString += '%';
-      code0 = (c >> 4) & 0xF;
-      code1 = c & 0xF;
-      encodedString += char(code0 > 9 ? code0 - 10 + 'A' : code0 + '0');
-      encodedString += char(code1 > 9 ? code1 - 10 + 'A' : code1 + '0');
-    }
-  }
-  return encodedString;
 }
 
 void loop() {
-  // Verifica se botão de reset foi pressionado
+  // Reset WiFi se botão pressionado
   if (digitalRead(resetWiFiPin) == LOW) {
     Serial.println("Botão D3 pressionado: apagando credenciais e reiniciando...");
     WiFi.disconnect(true);
@@ -302,55 +248,78 @@ void loop() {
 
   unsigned long agora = millis();
 
-  // Debounce do botão
-  bool leituraBotao = (digitalRead(botaoPin) == HIGH);
-  if (leituraBotao != estadoAnteriorBotao) {
-    tempoUltimaMudanca = agora;
-  }
-
-  if ((agora - tempoUltimaMudanca) > tempoDebounce) {
-    if (leituraBotao != estadoAtualBotao) {
-      estadoAtualBotao = leituraBotao;
-      if (estadoAtualBotao) {
-        Serial.println("*** BOTÃO PRESSIONADO DETECTADO ***");
-        tempoUltimoAperto = agora;
-        alertaAtivo = false;
-        if (!fluxoDetectado) {
-          enviarAviso("Fluxo respiratorio detectado");
-          fluxoDetectado = true;
-        }
-      }
+  // Período de estabilização
+  if (!sistemaEstabilizado) {
+    if ((agora - tempoInicializacao) >= tempoEstabilizacao) {
+      sistemaEstabilizado = true;
+      
+      // Primeira leitura após estabilização
+      delay(100);
+      bool leituraInicial = digitalRead(botaoPin);
+      leituraAnterior = leituraInicial;
+      
+      // Lógica: LOW = pressionado, HIGH = solto (devido ao pull-up)
+      botaoAtualmentePressionado = (leituraInicial == LOW);
+      botaoEstadoAnterior = botaoAtualmentePressionado;
+      
+      Serial.println("✓ Sistema estabilizado!");
+      Serial.println("Estado real detectado: " + String(botaoAtualmentePressionado ? "PRESSIONADO" : "NÃO PRESSIONADO"));
+      Serial.println("Leitura do pino: " + String(leituraInicial == HIGH ? "HIGH (solto)" : "LOW (pressionado)"));
+      Serial.println("Monitoramento ativo.\n");
+    } else {
+      // Durante estabilização, não detecta mudanças
+      digitalWrite(ledPin, LOW);
+      delay(10);
+      return;
     }
   }
 
-  estadoAnteriorBotao = leituraBotao;
-  bool botaoPressionado = estadoAtualBotao;
+  // DETECÇÃO DE MUDANÇAS COM DEBOUNCE
+  bool leituraAtual = digitalRead(botaoPin);
+  
+  // Se a leitura mudou, marca o tempo
+  if (leituraAtual != leituraAnterior) {
+    tempoUltimaMudanca = agora;
+    Serial.println("Mudança detectada no pino: " + String(leituraAtual == HIGH ? "HIGH" : "LOW"));
+  }
 
-  // Envia estado do botão a cada 3 segundos
+  // Se passou o tempo de debounce, processa a mudança
+  if ((agora - tempoUltimaMudanca) > tempoDebounce) {
+    // Converte leitura física para estado lógico
+    bool novoEstadoBotao = (leituraAtual == LOW);  // LOW = pressionado
+    
+    // Se o estado lógico mudou
+    if (novoEstadoBotao != botaoAtualmentePressionado) {
+      botaoAtualmentePressionado = novoEstadoBotao;
+      
+      Serial.println("========================");
+      if (botaoAtualmentePressionado) {
+        Serial.println("🔴 BOTÃO PRESSIONADO!");
+      } else {
+        Serial.println("⚪ BOTÃO SOLTO!");
+      }
+      Serial.println("========================");
+    }
+  }
+
+  leituraAnterior = leituraAtual;
+
+  // Debug periódico
+  static unsigned long ultimoDebug = 0;
+  if ((agora - ultimoDebug) >= 10000) { // A cada 10 segundos
+    Serial.println("📊 Estado atual: " + String(botaoAtualmentePressionado ? "PRESSIONADO" : "NÃO PRESSIONADO") + 
+                   " | Pino: " + String(leituraAtual == HIGH ? "HIGH" : "LOW"));
+    ultimoDebug = agora;
+  }
+
+  // Envia estado a cada 3 segundos
   if ((agora - tempoUltimoEnvioEstado) >= 3000) {
-    enviarEstadoBotao(botaoPressionado);
+    enviarEstadoBotao(botaoAtualmentePressionado);
     tempoUltimoEnvioEstado = agora;
   }
 
-  // Lógica do LED e alertas
-  if (botaoPressionado) {
-    digitalWrite(ledPin, HIGH);
-  } else if (agora - tempoUltimoAperto > 10000) { // 10 segundos sem detecção
-    digitalWrite(ledPin, HIGH);
-    if (!alertaAtivo) {
-      enviarAviso("Sem fluxo respiratorio - ALERTA INICIADO");
-      alertaAtivo = true;
-      tempoUltimaMensagem = agora;
-    } else if (agora - tempoUltimaMensagem >= 1000) { // Alerta contínuo a cada 1 segundo
-      enviarAviso("Sem fluxo respiratorio - ALERTA CONTINUO");
-      tempoUltimaMensagem = agora;
-    }
-    fluxoDetectado = false;
-  } else {
-    digitalWrite(ledPin, LOW);
-    fluxoDetectado = false;
-    alertaAtivo = false;
-  }
+  // Controle do LED
+  digitalWrite(ledPin, botaoAtualmentePressionado ? HIGH : LOW);
 
   delay(10);
 }

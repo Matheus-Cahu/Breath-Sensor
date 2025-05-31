@@ -1,0 +1,164 @@
+#include <ESP8266WiFi.h>
+#include <ESP8266HTTPClient.h>
+
+const char* ssid = "AnaMalta";
+const char* password = "Alm213164";
+const char* serverUrl = "http://SEU IP PÚBLICO:5000/aviso";
+
+const int ledPin = D1;
+const int botaoPin = D2;
+
+unsigned long tempoUltimoAperto = 0;
+unsigned long tempoUltimaMensagem = 0;
+bool fluxoDetectado = false;
+bool alertaAtivo = false;  // Nova variável para controlar o estado de alerta
+
+// Variáveis para debounce do botão
+bool estadoAnteriorBotao = false;
+bool estadoAtualBotao = false;
+unsigned long tempoUltimaMudanca = 0;
+const unsigned long tempoDebounce = 50;  // 50ms de debounce
+
+void setup() {
+  Serial.begin(115200);
+  pinMode(ledPin, OUTPUT);
+  pinMode(botaoPin, INPUT_PULLUP);
+  
+  WiFi.begin(ssid, password);
+  Serial.print("Conectando ao Wi-Fi");
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("\nWiFi conectado. IP: " + WiFi.localIP().toString());
+  
+  digitalWrite(ledPin, LOW);
+  tempoUltimoAperto = millis();
+  tempoUltimaMensagem = millis();
+}
+
+void enviarAviso(const char* mensagem) {
+  if (WiFi.status() == WL_CONNECTED) {
+    WiFiClient client;
+    HTTPClient http;
+    
+    String url = String(serverUrl) + "?mensagem=" + urlencode(mensagem);
+    Serial.println("Enviando para URL: " + url);
+    
+    http.begin(client, url);
+    http.addHeader("User-Agent", "ESP8266");
+    http.setTimeout(5000);  // Timeout de 5 segundos
+    
+    int httpCode = http.GET();
+    
+    if (httpCode > 0) {
+      String payload = http.getString();
+      Serial.printf("Aviso enviado: %s | Código HTTP: %d\n", mensagem, httpCode);
+      Serial.println("Resposta: " + payload);
+    } else {
+      Serial.printf("Falha ao enviar aviso: %s | Erro: %s\n", mensagem, http.errorToString(httpCode).c_str());
+    }
+    http.end();
+  } else {
+    Serial.println("Wi-Fi desconectado, não foi possível enviar aviso.");
+    // Tentar reconectar
+    WiFi.begin(ssid, password);
+  }
+}
+
+String urlencode(const char* str) {
+  String encodedString = "";
+  char c;
+  char code0;
+  char code1;
+  
+  for (int i = 0; str[i] != 0; i++) {
+    c = str[i];
+    if (isalnum(c)) {
+      encodedString += c;
+    } else {
+      encodedString += '%';
+      code0 = (c >> 4) & 0xF;
+      code1 = c & 0xF;
+      encodedString += char(code0 > 9 ? code0 - 10 + 'A' : code0 + '0');
+      encodedString += char(code1 > 9 ? code1 - 10 + 'A' : code1 + '0');
+    }
+  }
+  return encodedString;
+}
+
+void loop() {
+  unsigned long agora = millis();
+  
+  // Leitura do botão com debounce
+  bool leituraBotao = (digitalRead(botaoPin) == HIGH);
+  
+  // Se a leitura mudou desde a última vez
+  if (leituraBotao != estadoAnteriorBotao) {
+    tempoUltimaMudanca = agora;  // Marca o tempo da mudança
+  }
+  
+  // Se passou o tempo de debounce desde a última mudança
+  if ((agora - tempoUltimaMudanca) > tempoDebounce) {
+    // Se o estado atual é diferente do que tínhamos
+    if (leituraBotao != estadoAtualBotao) {
+      estadoAtualBotao = leituraBotao;
+      
+      // Se o botão foi pressionado (mudou de false para true)
+      if (estadoAtualBotao) {
+        Serial.println("*** BOTÃO PRESSIONADO DETECTADO ***");
+        tempoUltimoAperto = agora;  // SEMPRE reseta o timer quando pressionado
+        alertaAtivo = false;  // Desativa qualquer alerta ativo
+        
+        if (!fluxoDetectado) {
+          enviarAviso("Fluxo respiratorio detectado");
+          fluxoDetectado = true;
+        }
+      }
+    }
+  }
+  
+  // Salva o estado para a próxima iteração
+  estadoAnteriorBotao = leituraBotao;
+  
+  bool botaoPressionado = estadoAtualBotao;
+  
+  Serial.print("Leitura bruta: ");
+  Serial.print(digitalRead(botaoPin));
+  Serial.print(" | Botão: ");
+  Serial.print(botaoPressionado ? "PRESSIONADO" : "SOLTO");
+  Serial.print(" | Tempo desde último aperto: ");
+  Serial.print((agora - tempoUltimoAperto) / 1000);
+  Serial.println("s");
+  
+  // Controle do LED e estados baseado no botão processado
+  if (botaoPressionado) {
+    digitalWrite(ledPin, HIGH);
+    // Não precisa atualizar tempoUltimoAperto aqui pois já foi feito na detecção de borda
+  }
+  // Trata a ausência de fluxo
+  else if (agora - tempoUltimoAperto > 10000) {
+    digitalWrite(ledPin, HIGH); // LED acende como alerta
+    
+    // Primeira vez que entra no estado de alerta
+    if (!alertaAtivo) {
+      enviarAviso("Sem fluxo respiratorio - ALERTA INICIADO");
+      alertaAtivo = true;
+      tempoUltimaMensagem = agora;
+    }
+    // Continua enviando alertas a cada segundo
+    else if (agora - tempoUltimaMensagem >= 1000) {
+      enviarAviso("Sem fluxo respiratorio - ALERTA CONTINUO");
+      tempoUltimaMensagem = agora;
+    }
+    
+    fluxoDetectado = false;
+  }
+  // Caso normal: botão solto e ainda não passaram 10s
+  else {
+    digitalWrite(ledPin, LOW); // LED apagado
+    fluxoDetectado = false;
+    alertaAtivo = false;
+  }
+  
+  delay(10);  // Delay menor para melhor responsividade do botão

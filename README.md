@@ -42,7 +42,7 @@ Gostaria de agradecer ao Cauê Vilela e ao Gabriel Leão que desenvolveram o pro
 
 Agradeço também à equipe responsável pelo pitch: Victor Hugo Coutinho, Gustavo de Toledo e João Pedro Okita.
 
-## Conslusão
+## Conclusão
 
 Esperamos que esse projeto possa fazer alguma diferença no mundo. Mais uma vez reitero que se sintam livres para utilizar o código. No caso de eventuais dúvidas, entre em contato comigo pelo meu email: matheus.cahu@unifesp.br.
 

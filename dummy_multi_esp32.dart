@@ -2,36 +2,38 @@ import 'dart:io';
 import 'dart:math';
 import 'dart:async';
 
-void main() async {
+Future<void> main() async {
   final ip = await getLocalIp();
+  final server = await HttpServer.bind(
+    InternetAddress.anyIPv4,
+    8080, // Porta que desejar
+  );
 
-  final esp32Ports = [8080, 8081];
-  final servers = <HttpServer>[];
+  print('Servidor ESP32 Dummy rodando em: http://$ip:8080/data');
 
-  for (var port in esp32Ports) {
-    final server = await HttpServer.bind(InternetAddress.anyIPv4, port);
-    servers.add(server);
-    print('Dummy ESP32 rodando em http://$ip:$port/data');
+  final random = Random();
 
-    server.listen((HttpRequest request) {
-      if (request.method == 'GET' && request.uri.path == '/data') {
-        final value = Random().nextBool() ? '1' : '0';
-        request.response
-          ..statusCode = HttpStatus.ok
-          ..headers.contentType = ContentType.text
-          ..write(value)
-          ..close();
-        print('[$port] Enviado valor $value para ${request.connectionInfo?.remoteAddress.address}');
-      } else {
-        request.response
-          ..statusCode = HttpStatus.notFound
-          ..write('Not Found')
-          ..close();
-      }
-    });
+  await for (HttpRequest request in server) {
+    if (request.method == 'GET' && request.uri.path == '/data') {
+      final boolValue = random.nextBool() ? '1' : '0';
+
+      request.response
+        ..statusCode = HttpStatus.ok
+        ..headers.contentType = ContentType.text
+        ..write(boolValue);
+
+      print('Enviado: $boolValue para ${request.connectionInfo?.remoteAddress.address}');
+      await request.response.close();
+    } else {
+      request.response
+        ..statusCode = HttpStatus.notFound
+        ..write('Not Found');
+      await request.response.close();
+    }
   }
 }
 
+/// ✅ Função assíncrona atualizada para obter o IP local
 Future<String> getLocalIp() async {
   final interfaces = await NetworkInterface.list(
     type: InternetAddressType.IPv4,
@@ -40,7 +42,9 @@ Future<String> getLocalIp() async {
 
   for (var interface in interfaces) {
     for (var addr in interface.addresses) {
-      if (!addr.isLoopback) return addr.address;
+      if (!addr.isLoopback) {
+        return addr.address;
+      }
     }
   }
   return 'localhost';
